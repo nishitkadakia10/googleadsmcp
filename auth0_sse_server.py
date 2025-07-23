@@ -44,7 +44,11 @@ AUTH0_API_IDENTIFIER = os.environ.get('AUTH0_API_IDENTIFIER', '')
 AUTH0_ALGORITHMS = ['RS256']
 
 # Server Configuration
-SERVER_URL = os.environ.get('RAILWAY_STATIC_URL', 'http://localhost:8000')
+RAILWAY_URL = os.environ.get('RAILWAY_STATIC_URL', '')
+if RAILWAY_URL and not RAILWAY_URL.startswith('http'):
+    SERVER_URL = f"https://{RAILWAY_URL}"
+else:
+    SERVER_URL = RAILWAY_URL or 'http://localhost:8000'
 SESSION_SECRET = os.environ.get('SESSION_SECRET', secrets.token_urlsafe(32))
 
 # In-memory session store (use Redis in production)
