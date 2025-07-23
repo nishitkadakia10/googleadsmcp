@@ -36,10 +36,12 @@ def setup_credentials_file():
             
             # Update the environment variable to point to the temp file
             os.environ["GOOGLE_ADS_CREDENTIALS_PATH"] = temp_path
-            logger.info(f"Credentials file created at: {temp_path}")
+            
+            # Use print instead of logger if logger not available yet
+            print(f"Credentials file created at: {temp_path}")
             return temp_path
         except Exception as e:
-            logger.error(f"Failed to decode credentials: {str(e)}")
+            print(f"Failed to decode credentials: {str(e)}")
             raise
     
     return None
@@ -1499,6 +1501,10 @@ async def list_resources(
     return await run_gaql(customer_id, query)
 
 if __name__ == "__main__":
+    # Setup credentials first if needed
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("GOOGLE_ADS_CREDENTIALS_BASE64"):
+        setup_credentials_file()
+    
     # Railway provides PORT environment variable
     port = int(os.environ.get("PORT", 8000))
     
