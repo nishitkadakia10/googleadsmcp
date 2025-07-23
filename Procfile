@@ -1,1 +1,1 @@
-web: python google_ads_server.py
+web: python sse_server.py
