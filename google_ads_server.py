@@ -19,6 +19,18 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('google_ads_server')
 
+# Replace the existing mcp initialization with this:
+
+# Determine host and port based on environment
+if os.environ.get("RAILWAY_ENVIRONMENT"):
+    # Railway environment
+    host = "0.0.0.0"  # Railway requires binding to all interfaces
+    port = int(os.environ.get("PORT", 8000))
+else:
+    # Local development
+    host = "127.0.0.1"
+    port = 8000
+
 mcp = FastMCP(
     "google-ads-server",
     dependencies=[
@@ -26,7 +38,9 @@ mcp = FastMCP(
         "google-auth",
         "requests",
         "python-dotenv"
-    ]
+    ],
+    host=host,
+    port=port
 )
 
 # Constants and configuration
