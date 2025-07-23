@@ -11,9 +11,42 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 import logging
+import base64
+import tempfile
 
 # MCP
 from mcp.server.fastmcp import FastMCP
+
+def setup_credentials_file():
+    """
+    Setup credentials file from environment variable for Railway deployment.
+    """
+    # Check if we have base64 encoded credentials in environment
+    creds_base64 = os.environ.get("GOOGLE_ADS_CREDENTIALS_BASE64")
+    
+    if creds_base64:
+        try:
+            # Decode the credentials
+            creds_json = base64.b64decode(creds_base64).decode('utf-8')
+            
+            # Write to a temporary file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                f.write(creds_json)
+                temp_path = f.name
+            
+            # Update the environment variable to point to the temp file
+            os.environ["GOOGLE_ADS_CREDENTIALS_PATH"] = temp_path
+            logger.info(f"Credentials file created at: {temp_path}")
+            return temp_path
+        except Exception as e:
+            logger.error(f"Failed to decode credentials: {str(e)}")
+            raise
+    
+    return None
+
+# Call this function before any other setup
+if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("GOOGLE_ADS_CREDENTIALS_BASE64"):
+    setup_credentials_file()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
