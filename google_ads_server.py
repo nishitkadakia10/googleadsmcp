@@ -1452,5 +1452,15 @@ async def list_resources(
     return await run_gaql(customer_id, query)
 
 if __name__ == "__main__":
-    # Start the MCP server on stdio transport
-    mcp.run(transport="stdio")
+    # Railway provides PORT environment variable
+    port = int(os.environ.get("PORT", 8000))
+    
+    # Check if we're running in Railway (they set RAILWAY_ENVIRONMENT)
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        # In Railway, we need to run the SSE transport on the provided port
+        print(f"Starting MCP server on Railway port {port}")
+        mcp.run(transport="sse")
+    else:
+        # Local development uses stdio transport
+        print("Starting MCP server with stdio transport")
+        mcp.run(transport="stdio")
