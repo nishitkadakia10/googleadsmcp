@@ -12,6 +12,7 @@ import uuid
 import json
 import hashlib
 import hmac
+import secrets  # Add this import
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
