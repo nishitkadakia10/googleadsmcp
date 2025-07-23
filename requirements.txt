@@ -10,12 +10,10 @@ requests>=2.31.0
 # Environment configuration
 python-dotenv>=1.0.0
 
-# Auth0 requirements
+# Auth0 and SSE requirements
 PyJWT>=2.8.0
 cryptography>=41.0.0
-flask>=3.0.0
-flask-cors>=4.0.0
-
-# Optional dependencies
-matplotlib>=3.7.3
-pandas>=2.1.4
+python-jose[cryptography]>=3.3.0
+starlette>=0.31.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
