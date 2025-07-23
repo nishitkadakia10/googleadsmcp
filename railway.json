@@ -1,5 +1,9 @@
 {
   "deploy": {
-    "startCommand": "python auth0_sse_enhanced.py"
+    "startCommand": "python auth0_sse_server.py"
+  },
+  "build": {
+    "builder": "nixpacks",
+    "buildCommand": "pip install -r requirements.txt"
   }
 }
