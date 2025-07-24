@@ -16,7 +16,7 @@ import tempfile
 
 
 # MCP
-from fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP
 
 def setup_credentials_file():
     """
