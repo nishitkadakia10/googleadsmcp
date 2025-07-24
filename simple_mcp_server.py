@@ -83,7 +83,8 @@ async def handle_sse(request: Request):
             request.receive,
             request._send
         )
-        return  # Important: return after handling POST
+        # Return empty response for POST requests
+        return Response(status_code=200)
     
     # For initial connections (GET requests or POST without session_id), require API key
     if not API_KEYS:
@@ -153,6 +154,7 @@ async def handle_messages(request: Request):
         request.receive,
         request._send
     )
+    return Response(status_code=200)
 
 async def instructions(request: Request):
     """Simple instructions page"""
