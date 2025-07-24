@@ -64,6 +64,8 @@ async def health(request: Request):
 
 async def handle_sse(request: Request):
     """Handle SSE connections with API key authentication"""
+    # Handle both GET and POST requests (Claude sometimes uses POST)
+    
     # API key is REQUIRED
     if not API_KEYS:
         logger.error("No API keys configured - server is not properly secured!")
@@ -97,6 +99,17 @@ async def handle_sse(request: Request):
     # Valid API key - establish SSE connection
     logger.info(f"SSE connection established from {request.client.host}")
     
+    # Handle POST requests (Claude sometimes sends these)
+    if request.method == "POST":
+        # For POST requests, we need to handle them differently
+        await sse.handle_post_message(
+            request.scope,
+            request.receive,
+            request._send
+        )
+        return  # Important: return after handling POST
+    
+    # Handle GET requests (normal SSE connection)
     async with sse.connect_sse(
         request.scope,
         request.receive,
@@ -265,7 +278,7 @@ app = Starlette(
     routes=[
         Route("/", instructions),
         Route("/health", health),
-        Route("/sse", handle_sse),
+        Route("/sse", handle_sse, methods=["GET", "POST"]),  # Allow both GET and POST
         Route("/messages", handle_messages, methods=["POST"]),
     ],
     middleware=[
