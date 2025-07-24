@@ -1,5 +1,8 @@
 {
+  "build": {
+    "builder": "nixpacks"
+  },
   "deploy": {
-    "startCommand": "python auth0_sse_server.py"
+    "startCommand": "python simple_mcp_server.py"
   }
 }
