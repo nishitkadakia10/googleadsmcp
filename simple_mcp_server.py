@@ -7,12 +7,13 @@ Perfect for public deployment where each user runs their own instance
 import os
 import sys
 import logging
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, HTMLResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.responses import JSONResponse, HTMLResponse, Response
+from starlette.routing import Route, WebSocketRoute
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
@@ -62,100 +63,10 @@ async def health(request: Request):
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
-async def handle_sse(scope, receive, send):
-    """Handle SSE connections with API key authentication - raw ASGI handler"""
-    # Extract request info from scope
-    query_string = scope.get('query_string', b'').decode()
-    query_params = {}
-    if query_string:
-        for param in query_string.split('&'):
-            if '=' in param:
-                key, value = param.split('=', 1)
-                query_params[key] = value
+async def handle_sse(request: Request):
+    """Handle SSE connections with API key authentication"""
     
-    method = scope.get('method', 'GET')
-    headers = dict(scope.get('headers', []))
-    
-    # Handle HEAD requests
-    if method == "HEAD":
-        provided_key = query_params.get('api_key', '')
-        if provided_key and provided_key in API_KEYS:
-            await send({
-                'type': 'http.response.start',
-                'status': 200,
-                'headers': []
-            })
-            await send({
-                'type': 'http.response.body',
-                'body': b''
-            })
-        else:
-            await send({
-                'type': 'http.response.start',
-                'status': 401,
-                'headers': []
-            })
-            await send({
-                'type': 'http.response.body',
-                'body': b''
-            })
-        return
-    
-    # Check API key
-    if not API_KEYS:
-        await send({
-            'type': 'http.response.start',
-            'status': 500,
-            'headers': [[b'content-type', b'application/json']]
-        })
-        await send({
-            'type': 'http.response.body',
-            'body': b'{"error": "Server configuration error: No API keys set"}'
-        })
-        return
-    
-    provided_key = query_params.get('api_key', '')
-    if not provided_key:
-        auth_header = headers.get(b'authorization', b'').decode()
-        if auth_header.startswith('Bearer '):
-            provided_key = auth_header[7:]
-    
-    if not provided_key or provided_key not in API_KEYS:
-        await send({
-            'type': 'http.response.start',
-            'status': 401,
-            'headers': [[b'content-type', b'application/json']]
-        })
-        await send({
-            'type': 'http.response.body',
-            'body': b'{"error": "Invalid API key"}'
-        })
-        return
-    
-    # Valid API key - handle SSE or POST
-    client = scope.get('client', ['unknown', 0])
-    logger.info(f"SSE connection established from {client[0]}")
-    
-    # Let the SSE transport handle the connection
-    if method == "POST" and query_params.get('session_id'):
-        await sse.handle_post_message(scope, receive, send)
-    else:
-        # Handle SSE connection
-        async with sse.connect_sse(scope, receive, send) as streams:
-            await mcp._mcp_server.run(
-                streams[0],
-                streams[1],
-                mcp._mcp_server.create_initialization_options()
-            )
-
-# Wrap the raw ASGI handler for Starlette
-async def handle_sse_route(request: Request):
-    """Starlette route wrapper for SSE handler"""
-    await handle_sse(request.scope, request.receive, request._send)
-
-async def handle_messages(request: Request):
-    """Handle POST messages with authentication"""
-    # API key is REQUIRED
+    # Check API key first
     if not API_KEYS:
         return JSONResponse(
             {"error": "Server configuration error: No API keys set"},
@@ -171,12 +82,58 @@ async def handle_messages(request: Request):
     if not provided_key or provided_key not in API_KEYS:
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     
-    await sse.handle_post_message(
-        request.scope,
-        request.receive,
-        request._send
-    )
-    return Response(status_code=200)
+    # For POST requests with session_id, handle message
+    if request.method == "POST" and request.query_params.get('session_id'):
+        await sse.handle_post_message(
+            request.scope,
+            request.receive,
+            request._send
+        )
+        return Response(status_code=200)
+    
+    # Log connection
+    logger.info(f"SSE connection established from {request.client.host}")
+    
+    # Handle SSE connection using the MCP SSE transport
+    try:
+        # Return a streaming response that handles the SSE connection
+        async def sse_stream():
+            async with sse.connect_sse(
+                request.scope,
+                request.receive,
+                request._send
+            ) as streams:
+                await mcp._mcp_server.run(
+                    streams[0],
+                    streams[1],
+                    mcp._mcp_server.create_initialization_options()
+                )
+        
+        # Create the task but don't await it here
+        task = asyncio.create_task(sse_stream())
+        
+        # Return immediately with a valid response
+        # The SSE connection is handled in the background
+        return Response(
+            status_code=200,
+            headers={
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in SSE handler: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+async def handle_sse_head(request: Request):
+    """Handle HEAD requests for SSE endpoint"""
+    provided_key = request.query_params.get('api_key', '')
+    if provided_key and provided_key in API_KEYS:
+        return Response(status_code=200)
+    else:
+        return Response(status_code=401)
 
 async def instructions(request: Request):
     """Simple instructions page"""
@@ -313,13 +270,73 @@ async def oauth_not_required(request: Request):
         "authentication_method": "api_key"
     }, status_code=404)
 
+# Create a custom SSE endpoint that properly handles the ASGI interface
+class SSEEndpoint:
+    def __init__(self, sse_transport, api_keys):
+        self.sse = sse_transport
+        self.api_keys = api_keys
+
+    async def __call__(self, scope, receive, send):
+        # Extract query parameters
+        query_string = scope.get('query_string', b'').decode()
+        query_params = {}
+        if query_string:
+            for param in query_string.split('&'):
+                if '=' in param:
+                    key, value = param.split('=', 1)
+                    query_params[key] = value
+        
+        # Check API key
+        provided_key = query_params.get('api_key', '')
+        if not provided_key or provided_key not in self.api_keys:
+            await send({
+                'type': 'http.response.start',
+                'status': 401,
+                'headers': [[b'content-type', b'application/json']],
+            })
+            await send({
+                'type': 'http.response.body',
+                'body': b'{"error": "Invalid API key"}',
+            })
+            return
+        
+        # Handle different methods
+        method = scope.get('method', 'GET')
+        
+        if method == 'HEAD':
+            await send({
+                'type': 'http.response.start',
+                'status': 200,
+                'headers': [],
+            })
+            await send({
+                'type': 'http.response.body',
+                'body': b'',
+            })
+            return
+        
+        # Handle SSE connection
+        logger.info(f"SSE connection established")
+        
+        if method == "POST" and query_params.get('session_id'):
+            await self.sse.handle_post_message(scope, receive, send)
+        else:
+            async with self.sse.connect_sse(scope, receive, send) as streams:
+                await mcp._mcp_server.run(
+                    streams[0],
+                    streams[1],
+                    mcp._mcp_server.create_initialization_options()
+                )
+
+# Create SSE endpoint instance
+sse_endpoint = SSEEndpoint(sse, API_KEYS)
+
 # Create Starlette app
 app = Starlette(
     routes=[
         Route("/", instructions),
         Route("/health", health),
-        Route("/sse", handle_sse_route, methods=["GET", "POST", "HEAD"]),
-        Route("/messages", handle_messages, methods=["POST"]),
+        Route("/sse", endpoint=sse_endpoint, methods=["GET", "POST", "HEAD"]),
         Route("/.well-known/oauth-protected-resource/{path:path}", oauth_not_required),
     ],
     middleware=[
@@ -366,9 +383,13 @@ if __name__ == "__main__":
         # This ensures the MCP server is properly initialized
         logger.info("Initializing MCP server tools...")
         # The tools should already be registered via decorators in google_ads_server.py
-        logger.info(f"MCP server initialized with {len(mcp._resources)} resources and {len(mcp._tools)} tools")
+        if hasattr(mcp, '_mcp_server'):
+            logger.info(f"MCP server initialized successfully")
+        else:
+            logger.info("MCP server initialized (tools registered via decorators)")
     except Exception as e:
         logger.error(f"Error initializing MCP server: {str(e)}")
+        # Continue anyway - the decorators should have registered the tools
     
     # Start server
     import uvicorn
