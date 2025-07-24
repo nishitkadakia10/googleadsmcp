@@ -11,7 +11,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, HTMLResponse
+from starlette.responses import JSONResponse, HTMLResponse, Response
 from starlette.routing import Route
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -64,7 +64,15 @@ async def health(request: Request):
 
 async def handle_sse(request: Request):
     """Handle SSE connections with API key authentication"""
-    # Handle both GET and POST requests (Claude sometimes uses POST)
+    
+    # Handle HEAD requests (Claude uses these to check the endpoint)
+    if request.method == "HEAD":
+        # Just return 200 OK for HEAD requests with valid API key
+        provided_key = request.query_params.get('api_key', '')
+        if provided_key and provided_key in API_KEYS:
+            return Response(status_code=200)
+        else:
+            return Response(status_code=401)
     
     # For POST requests with session_id, we need to handle them specially
     if request.method == "POST" and request.query_params.get('session_id'):
@@ -274,13 +282,21 @@ async def instructions(request: Request):
     """
     return HTMLResponse(html)
 
+async def oauth_not_required(request: Request):
+    """Tell Claude that OAuth is not required for this server"""
+    return JSONResponse({
+        "error": "OAuth not required. Use API key authentication.",
+        "authentication_method": "api_key"
+    }, status_code=404)
+
 # Create Starlette app
 app = Starlette(
     routes=[
         Route("/", instructions),
         Route("/health", health),
-        Route("/sse", handle_sse, methods=["GET", "POST"]),  # Allow both GET and POST
+        Route("/sse", handle_sse, methods=["GET", "POST", "HEAD"]),  # Allow HEAD requests too
         Route("/messages", handle_messages, methods=["POST"]),
+        Route("/.well-known/oauth-protected-resource/{path:path}", oauth_not_required),
     ],
     middleware=[
         Middleware(
