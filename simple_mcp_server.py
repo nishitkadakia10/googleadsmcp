@@ -11,7 +11,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, HTMLResponse, Response
+from starlette.responses import JSONResponse, HTMLResponse, Response, StreamingResponse
 from starlette.routing import Route
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -62,74 +62,96 @@ async def health(request: Request):
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
-async def handle_sse(request: Request):
-    """Handle SSE connections with API key authentication"""
+async def handle_sse(scope, receive, send):
+    """Handle SSE connections with API key authentication - raw ASGI handler"""
+    # Extract request info from scope
+    query_string = scope.get('query_string', b'').decode()
+    query_params = {}
+    if query_string:
+        for param in query_string.split('&'):
+            if '=' in param:
+                key, value = param.split('=', 1)
+                query_params[key] = value
     
-    # Handle HEAD requests (Claude uses these to check the endpoint)
-    if request.method == "HEAD":
-        # Just return 200 OK for HEAD requests with valid API key
-        provided_key = request.query_params.get('api_key', '')
+    method = scope.get('method', 'GET')
+    headers = dict(scope.get('headers', []))
+    
+    # Handle HEAD requests
+    if method == "HEAD":
+        provided_key = query_params.get('api_key', '')
         if provided_key and provided_key in API_KEYS:
-            return Response(status_code=200)
+            await send({
+                'type': 'http.response.start',
+                'status': 200,
+                'headers': []
+            })
+            await send({
+                'type': 'http.response.body',
+                'body': b''
+            })
         else:
-            return Response(status_code=401)
+            await send({
+                'type': 'http.response.start',
+                'status': 401,
+                'headers': []
+            })
+            await send({
+                'type': 'http.response.body',
+                'body': b''
+            })
+        return
     
-    # For POST requests with session_id, we need to handle them specially
-    if request.method == "POST" and request.query_params.get('session_id'):
-        # This is a message for an existing SSE session
-        # The session was already authenticated during the initial GET request
-        await sse.handle_post_message(
-            request.scope,
-            request.receive,
-            request._send
-        )
-        # Return empty response for POST requests
-        return Response(status_code=200)
-    
-    # For initial connections (GET requests or POST without session_id), require API key
+    # Check API key
     if not API_KEYS:
-        logger.error("No API keys configured - server is not properly secured!")
-        return JSONResponse(
-            {"error": "Server configuration error: No API keys set"},
-            status_code=500
-        )
+        await send({
+            'type': 'http.response.start',
+            'status': 500,
+            'headers': [[b'content-type', b'application/json']]
+        })
+        await send({
+            'type': 'http.response.body',
+            'body': b'{"error": "Server configuration error: No API keys set"}'
+        })
+        return
     
-    # Check for API key in query params or header
-    provided_key = request.query_params.get('api_key', '')
+    provided_key = query_params.get('api_key', '')
     if not provided_key:
-        auth_header = request.headers.get('authorization', '')
+        auth_header = headers.get(b'authorization', b'').decode()
         if auth_header.startswith('Bearer '):
             provided_key = auth_header[7:]
     
-    # Verify API key
-    if not provided_key:
-        logger.warning(f"Missing API key from {request.client.host}")
-        return JSONResponse(
-            {"error": "API key required. Add ?api_key=YOUR_KEY to the URL"},
-            status_code=401
-        )
+    if not provided_key or provided_key not in API_KEYS:
+        await send({
+            'type': 'http.response.start',
+            'status': 401,
+            'headers': [[b'content-type', b'application/json']]
+        })
+        await send({
+            'type': 'http.response.body',
+            'body': b'{"error": "Invalid API key"}'
+        })
+        return
     
-    if provided_key not in API_KEYS:
-        logger.warning(f"Invalid API key attempt from {request.client.host}")
-        return JSONResponse(
-            {"error": "Invalid API key"},
-            status_code=401
-        )
+    # Valid API key - handle SSE or POST
+    client = scope.get('client', ['unknown', 0])
+    logger.info(f"SSE connection established from {client[0]}")
     
-    # Valid API key - establish SSE connection
-    logger.info(f"SSE connection established from {request.client.host}")
-    
-    # Handle GET requests (normal SSE connection)
-    async with sse.connect_sse(
-        request.scope,
-        request.receive,
-        request._send
-    ) as streams:
-        await mcp._mcp_server.run(
-            streams[0],
-            streams[1],
-            mcp._mcp_server.create_initialization_options()
-        )
+    # Let the SSE transport handle the connection
+    if method == "POST" and query_params.get('session_id'):
+        await sse.handle_post_message(scope, receive, send)
+    else:
+        # Handle SSE connection
+        async with sse.connect_sse(scope, receive, send) as streams:
+            await mcp._mcp_server.run(
+                streams[0],
+                streams[1],
+                mcp._mcp_server.create_initialization_options()
+            )
+
+# Wrap the raw ASGI handler for Starlette
+async def handle_sse_route(request: Request):
+    """Starlette route wrapper for SSE handler"""
+    await handle_sse(request.scope, request.receive, request._send)
 
 async def handle_messages(request: Request):
     """Handle POST messages with authentication"""
@@ -296,7 +318,7 @@ app = Starlette(
     routes=[
         Route("/", instructions),
         Route("/health", health),
-        Route("/sse", handle_sse, methods=["GET", "POST", "HEAD"]),  # Allow HEAD requests too
+        Route("/sse", handle_sse_route, methods=["GET", "POST", "HEAD"]),
         Route("/messages", handle_messages, methods=["POST"]),
         Route("/.well-known/oauth-protected-resource/{path:path}", oauth_not_required),
     ],
@@ -321,12 +343,32 @@ if __name__ == "__main__":
     logger.info(f"Starting Google Ads MCP Server on port {port}")
     logger.info(f"Server URL: {SERVER_URL}")
     
+    # Check Google Ads configuration
+    if not os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN"):
+        logger.warning("GOOGLE_ADS_DEVELOPER_TOKEN not set - Google Ads tools may not work properly")
+    
+    if not os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH") and not os.environ.get("GOOGLE_ADS_CREDENTIALS_BASE64"):
+        logger.warning("No Google Ads credentials configured - tools will not be available")
+    
+    # Log authentication type
+    auth_type = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")
+    logger.info(f"Google Ads auth type: {auth_type}")
+    
     if not API_KEYS:
         logger.error("WARNING: No API keys configured!")
         logger.error("Set MCP_API_KEY (single key) or MCP_API_KEYS (comma-separated) environment variable")
         logger.error("Server will reject all requests until API keys are configured")
     else:
         logger.info(f"API Key Protection: Enabled ({len(API_KEYS)} keys loaded)")
+    
+    # Initialize the MCP server before starting the web server
+    try:
+        # This ensures the MCP server is properly initialized
+        logger.info("Initializing MCP server tools...")
+        # The tools should already be registered via decorators in google_ads_server.py
+        logger.info(f"MCP server initialized with {len(mcp._resources)} resources and {len(mcp._tools)} tools")
+    except Exception as e:
+        logger.error(f"Error initializing MCP server: {str(e)}")
     
     # Start server
     import uvicorn
