@@ -66,7 +66,18 @@ async def handle_sse(request: Request):
     """Handle SSE connections with API key authentication"""
     # Handle both GET and POST requests (Claude sometimes uses POST)
     
-    # API key is REQUIRED
+    # For POST requests with session_id, we need to handle them specially
+    if request.method == "POST" and request.query_params.get('session_id'):
+        # This is a message for an existing SSE session
+        # The session was already authenticated during the initial GET request
+        await sse.handle_post_message(
+            request.scope,
+            request.receive,
+            request._send
+        )
+        return  # Important: return after handling POST
+    
+    # For initial connections (GET requests or POST without session_id), require API key
     if not API_KEYS:
         logger.error("No API keys configured - server is not properly secured!")
         return JSONResponse(
@@ -98,16 +109,6 @@ async def handle_sse(request: Request):
     
     # Valid API key - establish SSE connection
     logger.info(f"SSE connection established from {request.client.host}")
-    
-    # Handle POST requests (Claude sometimes sends these)
-    if request.method == "POST":
-        # For POST requests, we need to handle them differently
-        await sse.handle_post_message(
-            request.scope,
-            request.receive,
-            request._send
-        )
-        return  # Important: return after handling POST
     
     # Handle GET requests (normal SSE connection)
     async with sse.connect_sse(
