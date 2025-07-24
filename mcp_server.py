@@ -34,8 +34,22 @@ if RAILWAY_URL and not RAILWAY_URL.startswith('http'):
 else:
     SERVER_URL = RAILWAY_URL or 'http://localhost:8000'
 
-# Simple API Key from environment variable
-API_KEY = os.environ.get('MCP_API_KEY', '')
+# API Keys Configuration
+# Option 1: Single API key (simplest)
+SINGLE_API_KEY = os.environ.get('MCP_API_KEY', '')
+
+# Option 2: Multiple API keys (comma-separated)
+MULTIPLE_API_KEYS = os.environ.get('MCP_API_KEYS', '')
+
+# Parse API keys
+if MULTIPLE_API_KEYS:
+    # Multiple keys: "key1,key2,key3"
+    API_KEYS = set(k.strip() for k in MULTIPLE_API_KEYS.split(',') if k.strip())
+elif SINGLE_API_KEY:
+    # Single key for backwards compatibility
+    API_KEYS = {SINGLE_API_KEY}
+else:
+    API_KEYS = set()
 
 # Create SSE transport
 sse = SseServerTransport("/sse")
@@ -51,10 +65,10 @@ async def health(request: Request):
 async def handle_sse(request: Request):
     """Handle SSE connections with API key authentication"""
     # API key is REQUIRED
-    if not API_KEY:
-        logger.error("No API key configured - server is not properly secured!")
+    if not API_KEYS:
+        logger.error("No API keys configured - server is not properly secured!")
         return JSONResponse(
-            {"error": "Server configuration error: No API key set"},
+            {"error": "Server configuration error: No API keys set"},
             status_code=500
         )
     
@@ -73,7 +87,7 @@ async def handle_sse(request: Request):
             status_code=401
         )
     
-    if provided_key != API_KEY:
+    if provided_key not in API_KEYS:
         logger.warning(f"Invalid API key attempt from {request.client.host}")
         return JSONResponse(
             {"error": "Invalid API key"},
@@ -97,9 +111,9 @@ async def handle_sse(request: Request):
 async def handle_messages(request: Request):
     """Handle POST messages with authentication"""
     # API key is REQUIRED
-    if not API_KEY:
+    if not API_KEYS:
         return JSONResponse(
-            {"error": "Server configuration error: No API key set"},
+            {"error": "Server configuration error: No API keys set"},
             status_code=500
         )
     
@@ -109,7 +123,7 @@ async def handle_messages(request: Request):
         if auth_header.startswith('Bearer '):
             provided_key = auth_header[7:]
     
-    if not provided_key or provided_key != API_KEY:
+    if not provided_key or provided_key not in API_KEYS:
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     
     await sse.handle_post_message(
@@ -120,8 +134,8 @@ async def handle_messages(request: Request):
 
 async def instructions(request: Request):
     """Simple instructions page"""
-    if not API_KEY:
-        # Show warning if no API key is configured
+    if not API_KEYS:
+        # Show warning if no API keys are configured
         html = """
         <!DOCTYPE html>
         <html>
@@ -153,8 +167,10 @@ async def instructions(request: Request):
         <body>
             <h1>⚠️ Configuration Error</h1>
             <div class="error">
-                <strong>No API key configured!</strong><br><br>
-                This server requires an API key to be set in the environment variable <code>MCP_API_KEY</code>.<br><br>
+                <strong>No API keys configured!</strong><br><br>
+                This server requires API keys to be set. Use one of these environment variables:<br><br>
+                <code>MCP_API_KEY</code> - For a single API key<br>
+                <code>MCP_API_KEYS</code> - For multiple API keys (comma-separated)<br><br>
                 Please configure the server properly before use.
             </div>
         </body>
@@ -273,11 +289,12 @@ if __name__ == "__main__":
     logger.info(f"Starting Google Ads MCP Server on port {port}")
     logger.info(f"Server URL: {SERVER_URL}")
     
-    if not API_KEY:
-        logger.error("WARNING: No API key configured! Set MCP_API_KEY environment variable")
-        logger.error("Server will reject all requests until an API key is configured")
+    if not API_KEYS:
+        logger.error("WARNING: No API keys configured!")
+        logger.error("Set MCP_API_KEY (single key) or MCP_API_KEYS (comma-separated) environment variable")
+        logger.error("Server will reject all requests until API keys are configured")
     else:
-        logger.info("API Key Protection: Enabled")
+        logger.info(f"API Key Protection: Enabled ({len(API_KEYS)} keys loaded)")
     
     # Start server
     import uvicorn
