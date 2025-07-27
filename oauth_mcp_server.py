@@ -1,613 +1,375 @@
-#!/usr/bin/env python3
 """
-Google Ads MCP Server with Auth0 OAuth Authentication
-For deployment on Railway with Claude Desktop
+Google Ads MCP Server for Railway - GitHub Deploy Version
+No local setup required!
 """
 
 import os
-import sys
-import logging
-import asyncio
-import secrets
 import json
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urlencode, parse_qs
-from typing import Dict, Set, Optional
+import base64
+import secrets
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+import tempfile
+import atexit
 
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse, HTMLResponse, Response, RedirectResponse
-from starlette.routing import Route
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
-from starlette.middleware.sessions import SessionMiddleware
-from starlette.requests import Request
-from mcp.server.sse import SseServerTransport
-import httpx
+from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.responses import JSONResponse, RedirectResponse
+import uvicorn
 import jwt
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.backends import default_backend
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Google Ads related imports
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleRequest
+from google.auth.exceptions import RefreshError
+import requests
 
-from google_ads_server import mcp, setup_credentials_file
+# MCP
+from mcp.server.fastmcp import FastMCP
 
-# Configure logging
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Server Configuration
-RAILWAY_URL = os.environ.get('RAILWAY_STATIC_URL', '')
-if RAILWAY_URL and not RAILWAY_URL.startswith('http'):
-    SERVER_URL = f"https://{RAILWAY_URL}"
-else:
-    SERVER_URL = RAILWAY_URL or 'http://localhost:8000'
+app = FastAPI(title="Google Ads MCP Server")
 
-# Auth0 Configuration
-AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', '')  # e.g., 'your-tenant.auth0.com'
-AUTH0_CLIENT_ID = os.environ.get('AUTH0_CLIENT_ID', '')
-AUTH0_CLIENT_SECRET = os.environ.get('AUTH0_CLIENT_SECRET', '')
-AUTH0_AUDIENCE = os.environ.get('AUTH0_AUDIENCE', f'{SERVER_URL}/api')
-
-# Session configuration
-SESSION_SECRET_KEY = os.environ.get('SESSION_SECRET_KEY', secrets.token_urlsafe(32))
-
-# In-memory storage for active sessions (in production, use Redis or similar)
-active_sessions: Dict[str, dict] = {}
-
-# Create SSE transport
-sse = SseServerTransport("/sse")
-
-def validate_auth0_config():
-    """Validate Auth0 configuration on startup"""
-    if not all([AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET]):
-        logger.error("Missing Auth0 configuration!")
-        logger.error("Required environment variables:")
-        logger.error("  AUTH0_DOMAIN: Your Auth0 domain (e.g., 'your-tenant.auth0.com')")
-        logger.error("  AUTH0_CLIENT_ID: Your Auth0 application Client ID")
-        logger.error("  AUTH0_CLIENT_SECRET: Your Auth0 application Client Secret")
-        return False
-    return True
-
-async def get_auth0_jwks():
-    """Fetch Auth0 JWKS for token validation"""
-    async with httpx.AsyncClient() as client:
-        response = await client.get(f"https://{AUTH0_DOMAIN}/.well-known/jwks.json")
-        return response.json()
-
-def verify_auth0_token(token: str) -> Optional[dict]:
-    """Verify Auth0 JWT token"""
-    try:
-        # For simplicity, decode without verification in this example
-        # In production, properly verify with JWKS
-        unverified_header = jwt.get_unverified_header(token)
-        
-        # Decode and verify token
-        payload = jwt.decode(
-            token,
-            options={"verify_signature": False},  # In production, verify with JWKS
-            audience=AUTH0_AUDIENCE,
-            issuer=f"https://{AUTH0_DOMAIN}/"
-        )
-        return payload
-    except Exception as e:
-        logger.error(f"Token verification failed: {e}")
-        return None
-
-async def health(request: Request):
-    """Health check endpoint"""
-    return JSONResponse({
-        "status": "healthy",
-        "service": "google-ads-mcp",
-        "auth": "oauth",
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-
-async def oauth_status(request: Request):
-    """OAuth status endpoint for Claude Desktop"""
-    # Check if we have a valid session
-    session_token = request.cookies.get('mcp_session')
-    authenticated = session_token and session_token in active_sessions
-    
-    return JSONResponse({
-        "authenticated": authenticated,
-        "expires_at": active_sessions[session_token]['expires_at'].isoformat() if authenticated else None
-    })
-
-async def oauth_authorize(request: Request):
-    """OAuth authorization endpoint - redirects to Auth0"""
-    if not validate_auth0_config():
-        return JSONResponse({"error": "OAuth not configured"}, status_code=500)
-    
-    # Generate state for CSRF protection
-    state = secrets.token_urlsafe(32)
-    
-    # Store state in session (in production, use proper session storage)
-    request.session['oauth_state'] = state
-    
-    # Build Auth0 authorization URL
-    params = {
-        'response_type': 'code',
-        'client_id': AUTH0_CLIENT_ID,
-        'redirect_uri': f"{SERVER_URL}/oauth/callback",
-        'scope': 'openid profile email',
-        'state': state,
-        'audience': AUTH0_AUDIENCE
-    }
-    
-    auth_url = f"https://{AUTH0_DOMAIN}/authorize?{urlencode(params)}"
-    
-    return RedirectResponse(url=auth_url)
-
-async def oauth_callback(request: Request):
-    """OAuth callback endpoint - handles Auth0 response"""
-    # Get code and state from query params
-    code = request.query_params.get('code')
-    state = request.query_params.get('state')
-    error = request.query_params.get('error')
-    
-    if error:
-        return HTMLResponse(f"""
-            <html>
-            <body>
-                <h1>Authentication Error</h1>
-                <p>{error}: {request.query_params.get('error_description', '')}</p>
-                <p><a href="/">Try again</a></p>
-            </body>
-            </html>
-        """)
-    
-    # Verify state
-    stored_state = request.session.get('oauth_state')
-    if not state or state != stored_state:
-        return JSONResponse({"error": "Invalid state"}, status_code=400)
-    
-    if not code:
-        return JSONResponse({"error": "No authorization code"}, status_code=400)
-    
-    # Exchange code for tokens
-    async with httpx.AsyncClient() as client:
-        token_response = await client.post(
-            f"https://{AUTH0_DOMAIN}/oauth/token",
-            data={
-                'grant_type': 'authorization_code',
-                'client_id': AUTH0_CLIENT_ID,
-                'client_secret': AUTH0_CLIENT_SECRET,
-                'code': code,
-                'redirect_uri': f"{SERVER_URL}/oauth/callback"
-            }
-        )
-        
-        if token_response.status_code != 200:
-            return JSONResponse(
-                {"error": "Token exchange failed", "details": token_response.text}, 
-                status_code=400
-            )
-        
-        tokens = token_response.json()
-    
-    # Verify the ID token
-    id_token = tokens.get('id_token')
-    if not id_token:
-        return JSONResponse({"error": "No ID token received"}, status_code=400)
-    
-    # Decode token to get user info
-    user_info = verify_auth0_token(id_token)
-    if not user_info:
-        return JSONResponse({"error": "Invalid token"}, status_code=400)
-    
-    # Create session
-    session_id = secrets.token_urlsafe(32)
-    active_sessions[session_id] = {
-        'user': user_info,
-        'access_token': tokens.get('access_token'),
-        'expires_at': datetime.now(timezone.utc) + timedelta(hours=24)
-    }
-    
-    # Create response with session cookie
-    response = HTMLResponse("""
-        <html>
-        <head>
-            <title>Authentication Successful</title>
-            <style>
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    height: 100vh;
-                    margin: 0;
-                    background: #f5f5f5;
-                }
-                .success {
-                    background: white;
-                    padding: 40px;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                    text-align: center;
-                }
-                .success h1 { color: #4CAF50; }
-            </style>
-        </head>
-        <body>
-            <div class="success">
-                <h1>✅ Authentication Successful!</h1>
-                <p>You can now close this window and return to Claude Desktop.</p>
-                <p>Your session will remain active for 24 hours.</p>
-            </div>
-        </body>
-        </html>
-    """)
-    
-    response.set_cookie(
-        'mcp_session',
-        session_id,
-        httponly=True,
-        secure=True,
-        samesite='lax',
-        max_age=86400  # 24 hours
-    )
-    
-    return response
-
-async def handle_sse(request: Request):
-    """Handle SSE connections with OAuth authentication"""
-    # Check for session cookie
-    session_token = request.cookies.get('mcp_session')
-    
-    # Also check for bearer token in case Claude sends it
-    auth_header = request.headers.get('authorization', '')
-    if auth_header.startswith('Bearer '):
-        bearer_token = auth_header[7:]
-        # Verify the bearer token
-        token_info = verify_auth0_token(bearer_token)
-        if not token_info:
-            return JSONResponse({"error": "Invalid token"}, status_code=401)
-    elif session_token and session_token in active_sessions:
-        # Check session validity
-        session = active_sessions[session_token]
-        if datetime.now(timezone.utc) > session['expires_at']:
-            del active_sessions[session_token]
-            return JSONResponse({"error": "Session expired"}, status_code=401)
-    else:
-        return JSONResponse({"error": "Authentication required"}, status_code=401)
-    
-    # Handle SSE connection
-    logger.info(f"SSE connection established")
-    
-    # For POST requests with session_id, handle message
-    if request.method == "POST" and request.query_params.get('session_id'):
-        await sse.handle_post_message(
-            request.scope,
-            request.receive,
-            request._send
-        )
-        return Response(status_code=200)
-    
-    # Handle SSE connection using the MCP SSE transport
-    try:
-        # Return a streaming response that handles the SSE connection
-        async def sse_stream():
-            async with sse.connect_sse(
-                request.scope,
-                request.receive,
-                request._send
-            ) as streams:
-                await mcp._mcp_server.run(
-                    streams[0],
-                    streams[1],
-                    mcp._mcp_server.create_initialization_options()
-                )
-        
-        # Create the task but don't await it here
-        task = asyncio.create_task(sse_stream())
-        
-        # Return immediately with a valid response
-        return Response(
-            status_code=200,
-            headers={
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in SSE handler: {str(e)}")
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-async def manifest(request: Request):
-    """MCP manifest endpoint for Claude to discover server capabilities."""
-    return JSONResponse({
-        "name": "Google Ads MCP",
-        "description": "Access Google Ads data and analytics",
-        "version": "1.0.0",
-        "protocol_version": "1.0",
-        "auth": {
-            "type": "oauth2",
-            "oauth2": {
-                "authorize_url": f"{SERVER_URL}/oauth/authorize",
-                "token_url": f"{SERVER_URL}/oauth/token",
-                "client_id": AUTH0_CLIENT_ID,
-                "scope": "openid profile email"
-            }
-        },
-        "capabilities": {
-            "tools": True,
-            "resources": False,
-            "prompts": False
-        }
-    })
-
-async def instructions(request: Request):
-    """Instructions page"""
-    if not validate_auth0_config():
-        return HTMLResponse("""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Google Ads MCP Server - Configuration Error</title>
-            <style>
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    max-width: 800px;
-                    margin: 50px auto;
-                    padding: 20px;
-                }
-                .error {
-                    background: #f8d7da;
-                    border: 1px solid #f5c6cb;
-                    color: #721c24;
-                    padding: 20px;
-                    border-radius: 5px;
-                    margin-bottom: 20px;
-                }
-                code {
-                    background: #f4f4f4;
-                    padding: 2px 5px;
-                    border-radius: 3px;
-                    font-family: monospace;
-                }
-            </style>
-        </head>
-        <body>
-            <h1>⚠️ Configuration Error</h1>
-            <div class="error">
-                <strong>Auth0 not configured!</strong><br><br>
-                This server requires Auth0 to be configured. Set these environment variables:<br><br>
-                <code>AUTH0_DOMAIN</code> - Your Auth0 domain (e.g., 'your-tenant.auth0.com')<br>
-                <code>AUTH0_CLIENT_ID</code> - Your Auth0 application Client ID<br>
-                <code>AUTH0_CLIENT_SECRET</code> - Your Auth0 application Client Secret<br><br>
-                Please configure the server properly before use.
-            </div>
-        </body>
-        </html>
-        """)
-    
-    # Check if user is authenticated
-    session_token = request.cookies.get('mcp_session')
-    authenticated = session_token and session_token in active_sessions
-    
-    auth_status = "✅ Authenticated" if authenticated else "❌ Not authenticated"
-    auth_button = '<a href="/oauth/authorize" style="display: inline-block; background: #0066cc; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Login with Auth0</a>' if not authenticated else '<p>You are logged in!</p>'
-    
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Google Ads MCP Server</title>
-        <style>
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                max-width: 800px;
-                margin: 50px auto;
-                padding: 20px;
-                line-height: 1.6;
-            }}
-            .status {{
-                background: #d4edda;
-                border: 1px solid #c3e6cb;
-                padding: 15px;
-                border-radius: 5px;
-                margin-bottom: 30px;
-            }}
-            code {{
-                background: #f4f4f4;
-                padding: 2px 5px;
-                border-radius: 3px;
-                font-family: monospace;
-            }}
-            .url-box {{
-                background: #f8f9fa;
-                border: 1px solid #dee2e6;
-                padding: 15px;
-                border-radius: 5px;
-                margin: 20px 0;
-                word-break: break-all;
-                font-family: monospace;
-            }}
-        </style>
-    </head>
-    <body>
-        <h1>🚀 Google Ads MCP Server with OAuth</h1>
-        
-        <div class="status">
-            <strong>Status:</strong> ✅ Running<br>
-            <strong>Authentication:</strong> {auth_status}<br>
-            <strong>Auth Provider:</strong> Auth0<br>
-            <strong>Endpoint:</strong> <code>{SERVER_URL}</code>
-        </div>
-        
-        {auth_button}
-        
-        <h2>Claude Desktop Setup</h2>
-        <ol>
-            <li>First authenticate by clicking the login button above</li>
-            <li>Open Claude Desktop</li>
-            <li>Go to Settings → Developer → Edit Config</li>
-            <li>Add this server configuration:</li>
-        </ol>
-        
-        <div class="url-box">
-{{
-  "mcpServers": {{
-    "google-ads": {{
-      "uri": "{SERVER_URL}/sse",
-      "auth": {{
-        "type": "oauth",
-        "authorize_url": "{SERVER_URL}/oauth/authorize",
-        "pkce": false,
-        "polling": {{
-          "interval": 5000,
-          "status_url": "{SERVER_URL}/oauth/status"
-        }}
-      }}
-    }}
-  }}
-}}
-        </div>
-        
-        <h2>Available Tools</h2>
-        <ul>
-            <li>List Google Ads accounts</li>
-            <li>Get campaign performance</li>
-            <li>Analyze ad performance</li>
-            <li>Run custom GAQL queries</li>
-            <li>Manage image assets</li>
-        </ul>
-        
-        <hr>
-        <p><a href="/health">Health Check</a> | <a href="/oauth/status">Auth Status</a></p>
-    </body>
-    </html>
-    """
-    return HTMLResponse(html)
-
-# Create a custom SSE endpoint that handles OAuth
-class OAuthSSEEndpoint:
-    def __init__(self, sse_transport):
-        self.sse = sse_transport
-
-    async def __call__(self, scope, receive, send):
-        # Get cookies from headers
-        headers = dict(scope.get('headers', []))
-        cookie_header = headers.get(b'cookie', b'').decode()
-        
-        # Parse cookies
-        cookies = {}
-        if cookie_header:
-            for cookie in cookie_header.split(';'):
-                if '=' in cookie:
-                    key, value = cookie.strip().split('=', 1)
-                    cookies[key] = value
-        
-        # Check for session
-        session_token = cookies.get('mcp_session')
-        authenticated = False
-        
-        if session_token and session_token in active_sessions:
-            session = active_sessions[session_token]
-            if datetime.now(timezone.utc) <= session['expires_at']:
-                authenticated = True
-        
-        if not authenticated:
-            await send({
-                'type': 'http.response.start',
-                'status': 401,
-                'headers': [[b'content-type', b'application/json']],
-            })
-            await send({
-                'type': 'http.response.body',
-                'body': b'{"error": "Authentication required"}',
-            })
-            return
-        
-        # Handle different methods
-        method = scope.get('method', 'GET')
-        
-        if method == 'HEAD':
-            await send({
-                'type': 'http.response.start',
-                'status': 200,
-                'headers': [],
-            })
-            await send({
-                'type': 'http.response.body',
-                'body': b'',
-            })
-            return
-        
-        # Handle SSE connection
-        logger.info(f"Authenticated SSE connection established")
-        
-        # Extract query parameters
-        query_string = scope.get('query_string', b'').decode()
-        query_params = {}
-        if query_string:
-            for param in query_string.split('&'):
-                if '=' in param:
-                    key, value = param.split('=', 1)
-                    query_params[key] = value
-        
-        if method == "POST" and query_params.get('session_id'):
-            await self.sse.handle_post_message(scope, receive, send)
-        else:
-            async with self.sse.connect_sse(scope, receive, send) as streams:
-                await mcp._mcp_server.run(
-                    streams[0],
-                    streams[1],
-                    mcp._mcp_server.create_initialization_options()
-                )
-
-# Create SSE endpoint instance
-sse_endpoint = OAuthSSEEndpoint(sse)
-
-# Create Starlette app with session middleware
-app = Starlette(
-    routes=[
-        Route("/", instructions),
-        Route("/health", health),
-        Route("/manifest", manifest),  # Add manifest endpoint
-        Route("/oauth/authorize", oauth_authorize),
-        Route("/oauth/callback", oauth_callback),
-        Route("/oauth/status", oauth_status),
-        Route("/sse", endpoint=sse_endpoint, methods=["GET", "POST", "HEAD"]),
-    ],
-    middleware=[
-        Middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY),
-        Middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-            allow_credentials=True
-        )
-    ]
+# Initialize MCP
+mcp = FastMCP(
+    "google-ads-server",
+    dependencies=["google-auth-oauthlib", "google-auth", "requests"]
 )
 
-if __name__ == "__main__":
-    # Setup credentials if needed
-    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("GOOGLE_ADS_CREDENTIALS_BASE64"):
-        setup_credentials_file()
+# Configuration
+CLAUDE_CLIENT_ID = os.environ.get("CLAUDE_CLIENT_ID")
+CLAUDE_CLIENT_SECRET = os.environ.get("CLAUDE_CLIENT_SECRET")
+JWT_SECRET = os.environ.get("JWT_SECRET", "default-secret-please-change")
+API_VERSION = "v18"
+
+# Google Ads Configuration
+GOOGLE_ADS_CREDENTIALS_BASE64 = os.environ.get("GOOGLE_ADS_CREDENTIALS_BASE64")
+GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
+GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")
+GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")
+
+# Decode credentials if base64 provided
+TEMP_CREDENTIALS_FILE = None
+GOOGLE_ADS_CREDENTIALS_PATH = None
+
+if GOOGLE_ADS_CREDENTIALS_BASE64:
+    try:
+        credentials_json = base64.b64decode(GOOGLE_ADS_CREDENTIALS_BASE64).decode('utf-8')
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp_file:
+            tmp_file.write(credentials_json)
+            TEMP_CREDENTIALS_FILE = tmp_file.name
+            GOOGLE_ADS_CREDENTIALS_PATH = tmp_file.name
+        logger.info("Decoded credentials from base64")
+    except Exception as e:
+        logger.error(f"Error decoding credentials: {e}")
+
+# Cleanup temp file on exit
+def cleanup_temp_file():
+    if TEMP_CREDENTIALS_FILE and os.path.exists(TEMP_CREDENTIALS_FILE):
+        os.remove(TEMP_CREDENTIALS_FILE)
+
+atexit.register(cleanup_temp_file)
+
+# Simple storage
+auth_codes = {}
+tokens = {}
+
+# Google Ads helper functions
+def format_customer_id(customer_id: str) -> str:
+    """Format customer ID to 10 digits without dashes."""
+    customer_id = str(customer_id)
+    customer_id = customer_id.replace('\"', '').replace('"', '')
+    customer_id = ''.join(char for char in customer_id if char.isdigit())
+    return customer_id.zfill(10)
+
+def get_google_credentials():
+    """Get Google Ads credentials."""
+    if not GOOGLE_ADS_CREDENTIALS_PATH:
+        raise ValueError("No credentials configured")
     
-    # Get port from environment
-    port = int(os.environ.get("PORT", 8000))
-    
-    logger.info(f"Starting Google Ads MCP Server with OAuth on port {port}")
-    logger.info(f"Server URL: {SERVER_URL}")
-    
-    # Validate Auth0 configuration
-    if not validate_auth0_config():
-        logger.error("Please configure Auth0 environment variables before starting!")
+    if GOOGLE_ADS_AUTH_TYPE == "service_account":
+        return service_account.Credentials.from_service_account_file(
+            GOOGLE_ADS_CREDENTIALS_PATH,
+            scopes=['https://www.googleapis.com/auth/adwords']
+        )
     else:
-        logger.info(f"Auth0 Domain: {AUTH0_DOMAIN}")
-        logger.info("OAuth authentication enabled")
+        # For OAuth, we'll use the stored token
+        # In production, you'd implement proper OAuth flow
+        creds = Credentials.from_authorized_user_file(
+            GOOGLE_ADS_CREDENTIALS_PATH,
+            ['https://www.googleapis.com/auth/adwords']
+        )
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(GoogleRequest())
+        return creds
+
+def get_google_headers(creds):
+    """Get headers for Google Ads API."""
+    if not creds.valid:
+        if hasattr(creds, 'refresh'):
+            creds.refresh(GoogleRequest())
     
-    # Check Google Ads configuration
-    if not os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN"):
-        logger.warning("GOOGLE_ADS_DEVELOPER_TOKEN not set - Google Ads tools may not work properly")
+    return {
+        'Authorization': f'Bearer {creds.token}',
+        'developer-token': GOOGLE_ADS_DEVELOPER_TOKEN,
+        'content-type': 'application/json',
+        'login-customer-id': format_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID) if GOOGLE_ADS_LOGIN_CUSTOMER_ID else None
+    }
+
+# ===== OAuth Endpoints =====
+
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_metadata():
+    """OAuth metadata endpoint."""
+    base_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")
+    if not base_url.startswith("http"):
+        base_url = f"https://{base_url}"
     
-    # Start server
-    import uvicorn
+    return {
+        "issuer": base_url,
+        "authorization_endpoint": f"{base_url}/authorize",
+        "token_endpoint": f"{base_url}/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"]
+    }
+
+@app.get("/authorize")
+async def authorize(
+    client_id: str,
+    redirect_uri: str,
+    response_type: str,
+    state: str,
+    code_challenge: str,
+    code_challenge_method: str = "S256"
+):
+    """OAuth authorization endpoint."""
+    if client_id != CLAUDE_CLIENT_ID:
+        raise HTTPException(status_code=400, detail="Invalid client")
+    
+    code = secrets.token_urlsafe(32)
+    auth_codes[code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "expires": datetime.utcnow() + timedelta(minutes=5)
+    }
+    
+    return RedirectResponse(f"{redirect_uri}?code={code}&state={state}")
+
+@app.post("/token")
+async def token(request: Request):
+    """Token endpoint."""
+    form = await request.form()
+    
+    client_id = form.get("client_id")
+    client_secret = form.get("client_secret")
+    
+    if client_id != CLAUDE_CLIENT_ID or client_secret != CLAUDE_CLIENT_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid client")
+    
+    if form.get("grant_type") == "authorization_code":
+        code = form.get("code")
+        
+        if code not in auth_codes:
+            raise HTTPException(status_code=400, detail="Invalid code")
+        
+        auth_codes.pop(code)
+        
+        access_token = jwt.encode(
+            {"sub": "user", "exp": datetime.utcnow() + timedelta(hours=24)},
+            JWT_SECRET,
+            algorithm="HS256"
+        )
+        
+        tokens[access_token] = {"client_id": client_id}
+        
+        return {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 86400
+        }
+    
+    raise HTTPException(status_code=400, detail="Unsupported grant type")
+
+# ===== MCP Endpoints =====
+
+def verify_token(auth_header: Optional[str]) -> bool:
+    """Verify authorization token."""
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return False
+    
+    token = auth_header.split(" ")[1]
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return token in tokens
+    except:
+        return False
+
+@app.post("/mcp/v1/messages")
+async def mcp_endpoint(request: Request, authorization: Optional[str] = Header(None)):
+    """MCP protocol endpoint."""
+    if not verify_token(authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    message = await request.json()
+    method = message.get("method")
+    params = message.get("params", {})
+    
+    if method == "initialize":
+        return {
+            "protocolVersion": "2024-10-07",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "google-ads-server", "version": "1.0.0"}
+        }
+    
+    elif method == "tools/list":
+        return {
+            "tools": [
+                {
+                    "name": "list_accounts",
+                    "description": "List all accessible Google Ads accounts",
+                    "inputSchema": {"type": "object", "properties": {}}
+                },
+                {
+                    "name": "get_campaign_performance",
+                    "description": "Get campaign performance metrics",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "customer_id": {"type": "string"},
+                            "days": {"type": "integer", "default": 30}
+                        },
+                        "required": ["customer_id"]
+                    }
+                }
+            ]
+        }
+    
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        
+        try:
+            if tool_name == "list_accounts":
+                result = await list_accounts()
+            elif tool_name == "get_campaign_performance":
+                result = await get_campaign_performance(
+                    arguments.get("customer_id"),
+                    arguments.get("days", 30)
+                )
+            else:
+                raise HTTPException(status_code=404, detail=f"Unknown tool: {tool_name}")
+            
+            return {"content": [{"type": "text", "text": str(result)}]}
+        except Exception as e:
+            logger.error(f"Tool error: {str(e)}")
+            return {"content": [{"type": "text", "text": f"Error: {str(e)}"}], "isError": True}
+    
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown method: {method}")
+
+# ===== Google Ads Tools =====
+
+async def list_accounts() -> str:
+    """List Google Ads accounts."""
+    try:
+        creds = get_google_credentials()
+        headers = get_google_headers(creds)
+        
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            return f"Error: {response.text}"
+        
+        customers = response.json()
+        if not customers.get('resourceNames'):
+            return "No accounts found"
+        
+        result = ["Accessible Google Ads Accounts:"]
+        for resource in customers['resourceNames']:
+            customer_id = resource.split('/')[-1]
+            result.append(f"Account ID: {format_customer_id(customer_id)}")
+        
+        return "\n".join(result)
+    except Exception as e:
+        return f"Error listing accounts: {str(e)}"
+
+async def get_campaign_performance(customer_id: str, days: int = 30) -> str:
+    """Get campaign performance."""
+    try:
+        creds = get_google_credentials()
+        headers = get_google_headers(creds)
+        
+        formatted_id = format_customer_id(customer_id)
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_id}/googleAds:search"
+        
+        query = f"""
+            SELECT campaign.id, campaign.name, campaign.status,
+                   metrics.impressions, metrics.clicks, metrics.cost_micros
+            FROM campaign
+            WHERE segments.date DURING LAST_{days}_DAYS
+            ORDER BY metrics.cost_micros DESC
+            LIMIT 10
+        """
+        
+        response = requests.post(url, headers=headers, json={"query": query})
+        
+        if response.status_code != 200:
+            return f"Error: {response.text}"
+        
+        results = response.json()
+        if not results.get('results'):
+            return "No campaign data found"
+        
+        output = [f"Campaign Performance (Last {days} days):"]
+        output.append("-" * 50)
+        
+        for result in results['results']:
+            campaign = result.get('campaign', {})
+            metrics = result.get('metrics', {})
+            
+            output.append(f"Campaign: {campaign.get('name', 'N/A')}")
+            output.append(f"Status: {campaign.get('status', 'N/A')}")
+            output.append(f"Impressions: {metrics.get('impressions', 0)}")
+            output.append(f"Clicks: {metrics.get('clicks', 0)}")
+            output.append(f"Cost: ${metrics.get('costMicros', 0) / 1000000:.2f}")
+            output.append("-" * 50)
+        
+        return "\n".join(output)
+    except Exception as e:
+        return f"Error getting campaign data: {str(e)}"
+
+# ===== Utility Endpoints =====
+
+@app.get("/")
+async def root():
+    """Root endpoint with info."""
+    base_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")
+    if not base_url.startswith("http"):
+        base_url = f"https://{base_url}"
+    
+    return {
+        "name": "Google Ads MCP Server",
+        "status": "running",
+        "instructions": {
+            "1": "Add this URL to Claude as a custom connector",
+            "2": f"URL: {base_url}",
+            "3": f"Client ID: {CLAUDE_CLIENT_ID or 'NOT_SET'}",
+            "4": "Client Secret: Check your environment variables"
+        }
+    }
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
