@@ -3,6 +3,6 @@
     "builder": "nixpacks"
   },
   "deploy": {
-    "startCommand": "python simple_mcp_server.py"
+    "startCommand": "python oauth_mcp_server.py"
   }
 }
