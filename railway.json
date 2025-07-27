@@ -4,7 +4,7 @@
     "builder": "nixpacks"
   },
   "deploy": {
-    "startCommand": "python oauth_mcp_server.py"
+    "startCommand": "python oauth_mcp_server.py",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
