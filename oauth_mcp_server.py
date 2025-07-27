@@ -317,6 +317,29 @@ async def handle_sse(request: Request):
         logger.error(f"Error in SSE handler: {str(e)}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
+async def manifest(request: Request):
+    """MCP manifest endpoint for Claude to discover server capabilities."""
+    return JSONResponse({
+        "name": "Google Ads MCP",
+        "description": "Access Google Ads data and analytics",
+        "version": "1.0.0",
+        "protocol_version": "1.0",
+        "auth": {
+            "type": "oauth2",
+            "oauth2": {
+                "authorize_url": f"{SERVER_URL}/oauth/authorize",
+                "token_url": f"{SERVER_URL}/oauth/token",
+                "client_id": AUTH0_CLIENT_ID,
+                "scope": "openid profile email"
+            }
+        },
+        "capabilities": {
+            "tools": True,
+            "resources": False,
+            "prompts": False
+        }
+    })
+
 async def instructions(request: Request):
     """Instructions page"""
     if not validate_auth0_config():
@@ -545,6 +568,7 @@ app = Starlette(
     routes=[
         Route("/", instructions),
         Route("/health", health),
+        Route("/manifest", manifest),  # Add manifest endpoint
         Route("/oauth/authorize", oauth_authorize),
         Route("/oauth/callback", oauth_callback),
         Route("/oauth/status", oauth_status),
