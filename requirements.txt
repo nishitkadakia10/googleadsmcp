@@ -1,24 +1,12 @@
-# MCP Core
-mcp>=1.0.0
-
-# Google Ads API
+mcp>=0.1.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
 google-auth>=2.25.2
 google-auth-oauthlib>=1.1.0
 google-auth-httplib2>=0.1.1
 requests>=2.31.0
-
-# Web Server
-starlette>=0.31.0
-uvicorn>=0.24.0
-python-multipart>=0.0.6
-
-# OAuth and Sessions
-httpx>=0.25.0
-pyjwt[crypto]>=2.8.0
-itsdangerous>=2.1.2
-
-# Environment Configuration
+python-jose[cryptography]>=3.3.0
+PyJWT>=2.8.0
 python-dotenv>=1.0.0
-
-# Security
-cryptography>=41.0.0
+pydantic>=2.0.0
