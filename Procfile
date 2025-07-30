@@ -1,1 +1,1 @@
-web: python sse_server.py
+web: python google_ads_server_railway.py
