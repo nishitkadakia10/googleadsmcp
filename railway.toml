@@ -1,1 +1,13 @@
+[build]
+builder = "NIXPACKS"
 
+[deploy]
+startCommand = "python google_ads_server_railway.py"
+
+[build.env]
+NIXPACKS_PYTHON_VERSION = "3.11"
+
+[env]
+ENV = "PROD"
+MCP_PORT = "8000"
+LOG_LEVEL = "INFO"
